@@ -21,3 +21,15 @@ The agent uses Helius API for Solana transaction data and leverages large langua
 
 **Input**: Natural language queries about wallet activity
 **Output**: Formatted transaction summaries with detailed insights
+
+**Work Flow**
+
+![image](https://github.com/user-attachments/assets/d6cb9dc8-9327-4d12-a773-0e0bf1cd89ea)
+
+
+**Showcasing Video:**
+
+https://github.com/user-attachments/assets/927057e2-6d12-4a7f-9ed2-de2d420b630e
+
+
+
