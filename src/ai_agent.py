@@ -4,7 +4,7 @@ import asyncio
 import requests
 import re 
 import copy
-from llm import get_completion
+from src.llm import get_completion
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from uagents import Agent, Context, Protocol, Model
