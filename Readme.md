@@ -24,7 +24,7 @@ The agent uses Helius API for Solana transaction data and leverages large langua
 
 **Work Flow**
 
-![image](https://github.com/user-attachments/assets/d6cb9dc8-9327-4d12-a773-0e0bf1cd89ea)
+![image](https://github.com/user-attachments/assets/599ea190-d645-41a4-8a8d-732957a2c1e7)
 
 
 **Showcasing Video:**
