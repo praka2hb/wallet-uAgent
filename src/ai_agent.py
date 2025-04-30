@@ -23,12 +23,13 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 ASI_API_KEY = os.getenv("ASI_API_KEY")
 AGENT_SEED = os.getenv("AGENT_SEED")
 ALMANAC_TIMEOUT = 10  # Timeout in seconds for Almanac registration
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
 
 r = redis.Redis(
   host='evolved-arachnid-10421.upstash.io',
   port=6379,
-  password='ASi1AAIjcDEwNzkyMjkzNzg4NzY0NDRlYWYzNTNhYjExNzIwNzExNHAxMA',
+  password= REDIS_PASSWORD,
   ssl=True
 )
 
