@@ -7,7 +7,6 @@ test_agent = Agent(
     name="test_client",
     seed="test_client_seed",
     port=8001,
-    endpoint=["http://127.0.0.1:8001/submit"],
 )
 
 @test_agent.on_event("startup")

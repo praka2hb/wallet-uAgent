@@ -3,8 +3,9 @@ import httpx
 import asyncio
 import requests
 import re 
-import copy
-from src.llm import get_completion
+import redis
+from storage_manager import StorageManager
+from llm import get_completion
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from uagents import Agent, Context, Protocol, Model
@@ -14,18 +15,6 @@ from uagents_core.contrib.protocols.chat import (
 from tenacity import retry, stop_after_attempt, wait_exponential
 from uuid import uuid4
 
-from ai_engine.chitchat import ChitChatDialogue
-from ai_engine.messages import DialogueMessage as ChitChatDialogueMessage
-from ai_engine.dialogue import EdgeMetadata, EdgeDescription, create_edge
-
-init_state = "init"
-wallet_query_state = "wallet_query"
-wallet_command_state = "wallet_command"
-swap_query_state = "swap_query"
-nft_query_state = "nft_query"
-followup_state = "followup"
-about_agent_state = "about_agent"
-gratitude_state = "gratitude"
 
 
 # Load environment variables
@@ -34,35 +23,13 @@ HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 ASI_API_KEY = os.getenv("ASI_API_KEY")
 AGENT_SEED = os.getenv("AGENT_SEED")
 ALMANAC_TIMEOUT = 10  # Timeout in seconds for Almanac registration
-default_state = "default" 
 
-default_state = "default"
-init_state    = "init"
-followup_state= "followup"
 
-init_edge = create_edge(
-    name="InitiateSession",
-    description="Kick off a new chit‑chat session",
-    target="user", observable=True,
-    parent=default_state, child=init_state,
-)
-start_edge = create_edge(
-    name="StartDialogue",
-    description="User replies to greeting → start the flow",
-    target="ai",   observable=False,
-    parent=init_state,   child=followup_state,
-)
-continue_edge = create_edge(
-    name="ContinueDialogue",
-    description="Continue the session",
-    target="ai",   observable=False,
-    parent=followup_state, child=followup_state,
-)
-end_edge = create_edge(
-    name="EndSession",
-    description="User ends session",
-    target="agent", observable=True,
-    parent=followup_state, child=default_state,
+r = redis.Redis(
+  host='evolved-arachnid-10421.upstash.io',
+  port=6379,
+  password='ASi1AAIjcDEwNzkyMjkzNzg4NzY0NDRlYWYzNTNhYjExNzIwNzExNHAxMA',
+  ssl=True
 )
 
 agent = Agent(
@@ -73,6 +40,7 @@ agent = Agent(
     publish_agent_details=True,
 )
 
+storage = StorageManager(r, ttl_days=30)
 
 # Chat protocol
 chat_proto = Protocol(
@@ -81,20 +49,6 @@ chat_proto = Protocol(
     spec= chat_protocol_spec,  # Use the specification defined above
 )
 
-
-# 2.1 instantiate dialogue
-solana_dialogue = ChitChatDialogue(
-    version="0.1",
-    storage=agent.storage,
-)
-
-
-
-    
-
-TOKEN_CACHE = {}
-USER_TRANSACTION_HISTORY = {}
-USER_WALLETS = {}
 
 def is_valid_solana_address(address: str) -> bool:
     """Validate a Solana address without external dependencies."""
@@ -111,12 +65,13 @@ def is_valid_solana_address(address: str) -> bool:
     return all(c in base58_chars for c in address)
 
 async def get_token_symbol_helius(mint_address: str, ctx: Context = None) -> str:
-    """Fetch token symbol using Helius API with caching."""
+    """Fetch token symbol using Helius API with caching via StorageManager."""
     if not mint_address or mint_address == "Unknown":
         return "Unknown"
 
-    if mint_address in TOKEN_CACHE:
-        return TOKEN_CACHE[mint_address]
+    cached_symbol = storage.get_token(mint_address)
+    if cached_symbol:
+        return cached_symbol
 
     common_tokens = {
         "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v": "USDC",
@@ -136,8 +91,9 @@ async def get_token_symbol_helius(mint_address: str, ctx: Context = None) -> str
     }
 
     if mint_address in common_tokens:
-        TOKEN_CACHE[mint_address] = common_tokens[mint_address]
-        return common_tokens[mint_address]
+        symbol = common_tokens[mint_address]
+        storage.set_token(mint_address, symbol)
+        return symbol
 
     try:
         url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
@@ -151,13 +107,13 @@ async def get_token_symbol_helius(mint_address: str, ctx: Context = None) -> str
             resp = await client.post(url, json=payload)
             if resp.status_code != 200:
                 abbreviated = f"{mint_address[:4]}...{mint_address[-4:]}"
-                TOKEN_CACHE[mint_address] = abbreviated
+                storage.set_token(mint_address, abbreviated) # Use storage
                 return abbreviated
             data = resp.json()
             if "result" in data and "content" in data["result"] and "metadata" in data["result"]["content"]:
                 symbol = data["result"]["content"]["metadata"].get("symbol")
                 if symbol:
-                    TOKEN_CACHE[mint_address] = symbol
+                    storage.set_token(mint_address, symbol) # Use storage
                     if ctx:
                         ctx.logger.info(f"Found token via Helius: {mint_address} = {symbol}")
                     return symbol
@@ -168,7 +124,7 @@ async def get_token_symbol_helius(mint_address: str, ctx: Context = None) -> str
                 for token in token_list.get("tokens", []):
                     if token.get("address") == mint_address:
                         symbol = token.get("symbol", "Unknown")
-                        TOKEN_CACHE[mint_address] = symbol
+                        storage.set_token(mint_address, symbol) # Use storage
                         if ctx:
                             ctx.logger.info(f"Found token via Solana token list: {mint_address} = {symbol}")
                         return symbol
@@ -176,24 +132,268 @@ async def get_token_symbol_helius(mint_address: str, ctx: Context = None) -> str
         if ctx:
             ctx.logger.warning(f"Token lookup error for {mint_address}: {e}")
     abbreviated = f"{mint_address[:4]}...{mint_address[-4:]}"
-    TOKEN_CACHE[mint_address] = abbreviated
+    storage.set_token(mint_address, abbreviated) # Use storage
     return abbreviated
 
 
-# Initialize uAgent
+async def generate_defi_summary(transactions, ctx: Context, days: int = 7):
+    """Create a structured DeFi activity summary with platforms, stats, and recent actions."""
+    # Filter only defi_swap transactions
+    defi_txs = [tx for tx in transactions if tx.get("details", {}).get("type") == "defi_swap"]
+    
+    if not defi_txs:
+        return f"No DeFi transactions found in the last {days} days."
+    
+    platforms_in_txs = {tx.get("details", {}).get("platform", "Unknown") for tx in defi_txs}
+    single_platform = next(iter(platforms_in_txs)) if len(platforms_in_txs) == 1 else None
+    # Sort by timestamp, newest first
+    defi_txs.sort(key=lambda tx: tx.get("timestamp", 0), reverse=True)
+    
+    current_date = datetime.now()
+    
+    if single_platform and single_platform not in ["Unknown Platform", "DEX"]:
+        summary = f"# Your {single_platform} Swaps (Last {days} Days)\n\n"
+    else:
+        summary = f"# Your DeFi Activity (Last {days} Days)\n\n"
+    # Collect platform stats
+    platforms = {}
+    total_fees = 0
+    sol_to_dollar = await get_sol_usd_price() or 0
+    
+    for tx in defi_txs:
+        details = tx.get("details", {})
+        platform = details.get("platform", "Unknown")
+        if platform == "Unknown Platform":
+            platform = "Other DEX"
+        
+        if platform not in platforms:
+            platforms[platform] = {
+                "count": 0,
+                "tokens_swapped": set(),
+                "volume": 0,
+                "transactions": []
+            }
+        
+        platforms[platform]["count"] += 1
+        platforms[platform]["transactions"].append(tx)
+        
+        # Track unique tokens
+        from_token = details.get("from_token", "Unknown")
+        to_token = details.get("to_token", "Unknown")
+        if from_token != "Unknown Token" and from_token != "Unknown":
+            platforms[platform]["tokens_swapped"].add(from_token)
+        if to_token != "Unknown Token" and to_token != "Unknown":
+            platforms[platform]["tokens_swapped"].add(to_token)
+        
+        # Estimate fees (simplified approximation)
+        fee = 0.000005  # Base transaction fee in SOL
+        if details.get("platform") == "JUPITER":
+            fee += 0.0002  # Jupiter typical fee
+        elif details.get("platform") in ["RAYDIUM", "ORCA"]:
+            fee += 0.00015  # Typical DEX fee
+        total_fees += fee
+    
+    # Format the summary
+    current_date = datetime.now()
+    
+    summary = f"# Your DeFi Activity (Last {days} Days)\n\n"
+    
+    # Overall stats section
+    summary += f"## Overview\n"
+    summary += f"- **Total DeFi Transactions:** {len(defi_txs)}\n"
+    if sol_to_dollar:
+        summary += f"- **Estimated Fees Paid:** {total_fees:.6f} SOL (≈${total_fees * sol_to_dollar:.2f})\n"
+    else:
+        summary += f"- **Estimated Fees Paid:** {total_fees:.6f} SOL\n"
+    
+    # Platforms section
+    if platforms:
+        summary += f"- **Platforms Used:**\n"
+        for platform, data in sorted(platforms.items(), key=lambda x: x[1]["count"], reverse=True):
+            # Determine action type based on platform
+            action_type = "swaps"
+            if platform == "SOLEND":
+                action_type = "borrow/lend actions"
+            elif platform == "MARINADE":
+                action_type = "staking actions"
+            elif platform == "ORCA" and any("pool" in tx.get("details", {}).get("description", "").lower() for tx in data["transactions"]):
+                action_type = "liquidity interactions"
+            
+            summary += f"  • **{platform}:** {data['count']} {action_type}\n"
+    
+    # Recent actions section
+    summary += f"\n## Recent Actions\n"
+    for i, tx in enumerate(defi_txs[:5], 1):  # Show up to 5 most recent
+        details = tx.get("details", {})
+        date_str = datetime.fromtimestamp(tx.get("timestamp", 0)).strftime("%b %d")
+        
+        from_token = details.get("from_token", "Token")
+        to_token = details.get("to_token", "Token")
+        from_amount = details.get("from_amount", 0)
+        to_amount = details.get("to_amount", 0)
+        platform = details.get("platform", "DEX")
+        
+        # Format amounts nicely
+        from_amount_str = f"{from_amount:.4f}".rstrip('0').rstrip('.') if from_amount != 0 else "Some"
+        to_amount_str = f"{to_amount:.4f}".rstrip('0').rstrip('.') if to_amount != 0 else "Some"
+        
+        action_text = f"Swapped {from_amount_str} {from_token} for {to_amount_str} {to_token} via {platform}"
+        
+        # Special handling for specific platforms
+        if platform == "SOLEND":
+            if from_token == "SOL" or from_token in ["USDC", "USDT"]:
+                action_text = f"Deposited {from_amount_str} {from_token} as collateral on Solend"
+            else:
+                action_text = f"Borrowed {to_amount_str} {to_token} using {from_token} collateral on Solend"
+        elif platform == "MARINADE":
+            if to_token == "mSOL":
+                action_text = f"Staked {from_amount_str} {from_token} for {to_amount_str} mSOL on Marinade"
+            else:
+                action_text = f"Unstaked {from_amount_str} {from_token} for {to_amount_str} {to_token} on Marinade"
+        
+        summary += f"{i}. **{date_str}:** {action_text}\n"
+    
+    # Add Explorer links
+    summary += f"\n## Transaction Links\n"
+    for i, tx in enumerate(defi_txs[:3], 1):  # Show links to first 3 transactions
+        signature = tx.get("signature", "")
+        if signature:
+            summary += f"- [View Transaction {i}](https://explorer.solana.com/tx/{signature})\n"
+    
+    # Add a tips section
+    summary += f"\n## 💡 Tips\n"
+    summary += f"- Try 'Show my DeFi swaps from last month' for a longer history\n"
+    summary += f"- Ask about a specific platform with 'Show my *Platform* swaps'\n"
+    
+    return summary
 
+
+async def generate_nft_summary(transactions, ctx: Context, days: int = 7):
+    """Create a structured NFT activity summary with collections, stats, and recent actions."""
+    # Filter only NFT transactions
+    nft_txs = [tx for tx in transactions if tx.get("details", {}).get("type") in ["nft_mint", "nft_transfer"]]
+    
+    if not nft_txs:
+        return f"No NFT transactions found in the last {days} days."
+    
+    # Sort by timestamp, newest first
+    nft_txs.sort(key=lambda tx: tx.get("timestamp", 0), reverse=True)
+    
+    # Collect stats
+    collections = {}
+    mints = 0
+    transfers_in = 0
+    transfers_out = 0
+    
+    user_wallet = None
+    # Find user wallet from first transaction fee payer (fallback)
+    if nft_txs and "feePayer" in nft_txs[0]:
+        user_wallet = nft_txs[0]["feePayer"]
+    
+    for tx in nft_txs:
+        details = tx.get("details", {})
+        nft_name = details.get("token", "Unknown NFT")
+        tx_type = details.get("type")
+        
+        # Count by type and direction
+        if tx_type == "nft_mint":
+            mints += 1
+        elif tx_type == "nft_transfer":
+            # If to_address is user, it's incoming
+            if details.get("to_address") == "Your wallet":
+                transfers_in += 1
+            else:
+                transfers_out += 1
+        
+        # Track collections (simplified, would be better with actual collection data)
+        collection = "Unknown Collection"
+        # Extract collection from name if possible
+        if " #" in nft_name:
+            collection = nft_name.split(" #")[0]
+        
+        if collection not in collections:
+            collections[collection] = {"count": 0, "transactions": []}
+        
+        collections[collection]["count"] += 1
+        collections[collection]["transactions"].append(tx)
+    
+    # Format the summary
+    summary = f"# Your NFT Activity (Last {days} Days)\n\n"
+    
+    # Overall stats section
+    summary += f"## Overview\n"
+    summary += f"- **Total NFT Transactions:** {len(nft_txs)}\n"
+    if mints > 0:
+        summary += f"- **NFTs Minted:** {mints}\n"
+    summary += f"- **NFTs Received:** {transfers_in}\n"
+    summary += f"- **NFTs Sent:** {transfers_out}\n"
+    
+    # Collections section
+    if collections:
+        summary += f"- **Collections Involved:** {len(collections)}\n"
+        top_collections = sorted(collections.items(), key=lambda x: x[1]["count"], reverse=True)[:5]
+        if top_collections:
+            summary += f"\n## Top Collections\n"
+            for coll_name, data in top_collections:
+                summary += f"- **{coll_name}:** {data['count']} transactions\n"
+    
+    # Recent actions section
+    summary += f"\n## Recent NFT Activity\n"
+    for i, tx in enumerate(nft_txs[:10], 1):  # Show up to 10 most recent
+        details = tx.get("details", {})
+        date_str = datetime.fromtimestamp(tx.get("timestamp", 0)).strftime("%b %d")
+        
+        nft_name = details.get("token", "Unknown NFT")
+        tx_type = details.get("type")
+        from_addr = details.get("from_address", "Unknown")
+        to_addr = details.get("to_address", "Unknown")
+        
+        if tx_type == "nft_mint":
+            action_text = f"Minted {nft_name}"
+        elif tx_type == "nft_transfer":
+            if to_addr == "Your wallet":
+                action_text = f"Received {nft_name} from {from_addr}"
+            else:
+                action_text = f"Sent {nft_name} to {to_addr}"
+        else:
+            action_text = f"Interacted with {nft_name}"
+        
+        summary += f"{i}. **{date_str}:** {action_text}\n"
+    
+    # Add Explorer links
+    summary += f"\n## Transaction Links\n"
+    for i, tx in enumerate(nft_txs[:3], 1):  # Show links to first 3 transactions
+        signature = tx.get("signature", "")
+        if signature:
+            summary += f"- [View Transaction {i}](https://explorer.solana.com/tx/{signature})\n"
+    
+    # Add a tips section
+    summary += f"\n## 💡 Tips\n"
+    summary += f"- Try 'Show my NFT activity from last month' for a longer history\n"
+    summary += f"- You can also search for specific collections with 'Show my DeGods NFTs'\n"
+    
+    return summary
 
 async def get_sol_usd_price():
-    """Fetch the current SOL/USD price from CoinGecko."""
+    """Fetch the current SOL/USD price from CoinGecko with caching via StorageManager."""
+    token_id = "solana"
+    cached_price = storage.get_price(token_id)
+    if cached_price is not None:
+        return cached_price
+
     try:
         resp = requests.get(
             "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "solana", "vs_currencies": "usd"},
+            params={"ids": token_id, "vs_currencies": "usd"},
             timeout=5
         )
         resp.raise_for_status()
-        return float(resp.json()["solana"]["usd"])
-    except Exception:
+        price = float(resp.json()[token_id]["usd"])
+        storage.set_price(token_id, price) # Cache the price
+        return price
+    except Exception as e:
+        # Consider logging the error here
+        print(f"Error fetching SOL price: {e}")
         return None
 
 def parse_query(text):
@@ -201,7 +401,7 @@ def parse_query(text):
     text = text.lower()
     
     # Get activity type
-    if "nft" in text:
+    if any(term in text for term in ["nft", "collectible", "digital art", "pfp", "collection"]):
         activity_type = "nft"
     elif "defi" in text or "swap" in text:
         activity_type = "defi"
@@ -270,7 +470,17 @@ def parse_query(text):
     # Cap at 365 days for API limitations
     days = min(days, 365)
     
-    return activity_type, days
+    platform = None
+    if "jupiter" in text:
+        platform = "JUPITER"
+    elif "raydium" in text:
+        platform = "RAYDIUM"
+    elif "orca" in text:
+        platform = "ORCA"
+    elif "pump.fun" in text or "pumpfun" in text:
+        platform = "PUMP_FUN"
+    
+    return activity_type, days, platform
 
 # Direct check for SWAP transactions
 async def check_for_swap_transactions(wallet_address, days=7, ctx=None):
@@ -828,9 +1038,18 @@ async def parse_transaction(tx, ctx: Context = None):
                 mint = change.get("mint")
                 user_account = change.get("userAccount")
                 if mint:
+                    nft_name = "Unknown NFT"
+                    collection = "Unknown Collection"
+                    
+                    nft_events = tx.get("events", {}).get("nft", {})
+                    if nft_events:
+                        nft_name = nft_events.get("name", nft_name)
+                        collection = nft_events.get("collectionName", collection)
+                
                     details.update(
                         type="nft_mint",
-                        token=await get_token_symbol_helius(mint, ctx),
+                        token=nft_name,
+                        collection=collection,  # Store collection information
                         amount=1,
                         program="Token Program",
                         from_address="Mint Authority",
@@ -845,9 +1064,29 @@ async def parse_transaction(tx, ctx: Context = None):
     details["type"] = "unknown" # Explicitly mark as unknown if nothing else fits
     return details
 
-async def summarize_activity(transactions, ctx: Context, activity_type: str = "general", days: int = 7):
+async def summarize_activity(transactions, ctx: Context, activity_type: str = "general", days: int = 7, platform: str = None):
     """Summarize transactions based on activity type and time period with improved swap handling."""
-    # ... existing filtering logic ...
+    
+    if activity_type == "defi" and platform:
+        ctx.logger.info(f"Filtering DeFi activity specifically for platform: {platform}")
+        # Filter transactions first by the requested platform
+        platform_transactions = [
+            tx for tx in transactions
+            if isinstance(tx.get("details"), dict) and
+               tx["details"].get("platform", "").upper() == platform.upper() and
+               tx["details"].get("type") == "defi_swap" # Ensure it's still a swap
+        ]
+        if not platform_transactions:
+             return f"No DeFi swap transactions found for the platform '{platform}' in the last {days} days."
+        # Use only the platform-specific transactions for the DeFi summary
+        return await generate_defi_summary(platform_transactions, ctx, days)
+    elif activity_type == "defi":
+         # If general DeFi query, use the existing DeFi summary
+         return await generate_defi_summary(transactions, ctx, days)
+    elif activity_type == "nft":
+        # NFT summary doesn't typically filter by platform in this way
+        return await generate_nft_summary(transactions, ctx, days)
+    
     filtered = []
     seen_signatures = set()
 
@@ -895,7 +1134,12 @@ async def summarize_activity(transactions, ctx: Context, activity_type: str = "g
         if tx_type not in valid_types.get(activity_type, []):
             # ctx.logger.info(f"Skipping non-{activity_type} tx: {signature[:8]}, type={tx_type}") # Reduce noise
             continue
-
+        
+        tx_platform = d.get("platform", "").upper()
+        if platform and tx_platform != platform.upper():
+             # ctx.logger.info(f"Skipping tx {signature[:8]} due to platform mismatch (requested: {platform}, actual: {tx_platform})") # Optional logging
+             continue
+         
         # Skip transactions marked purely as fees
         if d.get("is_fee", False):
             ctx.logger.info(f"Skipping fee transaction: {signature[:8]}")
@@ -910,6 +1154,7 @@ async def summarize_activity(transactions, ctx: Context, activity_type: str = "g
     if not filtered:
         context = "You are a helpful Solana wallet Tracking History agent. You analyze on-chain activity and provide clear insights about transactions including SOL transfers, token movements, NFT activities, and DeFi swaps across various platforms. You help users understand their on-chain activity."
         activity_label = {"general": "meaningful", "nft": "NFT", "defi": "DeFi"}[activity_type]
+        platform_text = f" on {platform}" if platform else ""
         prompt = f"No {activity_label} transactions found in the last {days} days. Provide a friendly message suggesting the user check their wallet address or try a different time period."
         # Use max_tokens=150 for shorter messages
         return await get_completion(context, prompt, max_tokens=150)
@@ -997,10 +1242,11 @@ async def summarize_activity(transactions, ctx: Context, activity_type: str = "g
         prompt = f"No {activity_label} transactions found in the last {days} days. Provide a friendly message..."
         return await get_completion(context, prompt, max_tokens=150)
 
-    context = "You are a specialized Solana blockchain analytics agent that helps users track and understand their on-chain activity. You provide clear, detailed insights about transactions including SOL transfers, token movements, NFT activities, and DeFi swaps across various platforms like Jupiter, Raydium, Orca, and Pump.fun. You analyze transaction patterns, identify platforms used, and present wallet history in a user-friendly format with USD value estimates when available. You're professional but conversational, focusing on accuracy and clarity when explaining complex blockchain interactions."
+    context = "You are a specialized Solana blockchain analytics agent..."
     activity_label = {"general": "", "nft": "NFT", "defi": "DeFi"}[activity_type]
+    platform_context = f" specifically on the {platform} platform" if platform else ""
     prompt = (
-        f"List ALL {len(filtered)} {activity_label} transactions below EXACTLY as provided, in order (oldest first), from the {time_period_text}. "
+        f"List ALL {len(filtered)} {activity_label} transactions below EXACTLY as provided, in order (oldest first), from the {time_period_text}{platform_context}. "
         "Use the format: '<number>. <date> | <TYPE> | <Details> | <From> -> <To> | <Tx Sig>'. "
         "For SWAPs, show amounts, tokens (use symbol or abbreviated address like 'EPjF...Dt1v' if symbol unknown), platform, and approximate USD value if possible (e.g., 'SWAP 100 USDC for 1 SOL (~$150.00) on JUPITER'). "
         "For NFTs, show token name/symbol. For TRANSFERS, show amount and token. "
@@ -1031,12 +1277,13 @@ async def summarize_activity(transactions, ctx: Context, activity_type: str = "g
         return summary
     except Exception as e:
         ctx.logger.error(f"Error getting LLM completion: {e}")
-        return generate_compact_fallback(filtered, sol_usd, activity_type, days)
+        return generate_compact_fallback(filtered, sol_usd, activity_type, days, platform)
 
 
-def generate_compact_fallback(transactions, sol_usd, activity_type: str = "general", days: int = 7):
+def generate_compact_fallback(transactions, sol_usd, activity_type: str = "general", days: int = 7, platform: str = None):
     """Generate a compact summary with categorized transactions (fallback)."""
-    lines = [f"Summary of your Solana {activity_type.upper()} activity (last {days} days, oldest first):\n"]
+    platform_text = f" on {platform}" if platform else ""
+    lines = [f"Summary of your Solana {activity_type.upper()} activity{platform_text} (last {days} days, oldest first):\n"]
     categories = {"TRANSFER": [], "SWAP": [], "NFT": []}
 
     for i, tx in enumerate(transactions, 1):
@@ -1194,6 +1441,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     activity_pattern = r'\b(activit(?:y|ies)|transaction|history|record|log|event)\b'
     asset_pattern = r'\b(nft|token|sol|usdc|swap|defi|crypto|coin)\b'
     action_pattern = r'\b(check|show|view|tell|give|look|find|what(?:[\'s]|\sis|\shappened))\b'
+    collection_search_pattern = r'\b(?:my|show|check|what(?:\'s|s|\sis))\s+(?:my\s+)?([\w\s]+)\s+(?:nft|collection|collectible)s?\b'
     
     is_wallet_query = (
         re.search(wallet_pattern, text) is not None or 
@@ -1205,8 +1453,12 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
         )
     )
     
+    collection_match = re.search(collection_search_pattern, text)
+    if collection_match:
+        collection_name = collection_match.group(1).strip()
+    
     # Possessive forms with word boundaries
-    possessive_pattern = r'\b(my|mine|our|mis?|me[uios]|mein|mon|ma|notr?e|我的|私の|내|나의|мо[йяе])\b'
+    possessive_pattern = r'\b(my|mine|our|mis?|me[uios]|mein|mon|ma|notr?e|我的|私の|내|나의|moйяе)\b'
     is_my_query = re.search(possessive_pattern, text) is not None
     
     # Gratitude detection with word boundaries
@@ -1215,7 +1467,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     is_only_gratitude = is_gratitude and not is_wallet_query
     
     # Swap detection with better pattern matching
-    swap_pattern = r'\b(swap|exchange|trade)[s]?(?:\s+(history|activity|transactions|records))?\b'
+    swap_pattern = r'\b(?:swap|exchange|trade)s?(?:\s+(?:history|activity|transactions|records))?\b'
     is_general_swap_query = re.search(swap_pattern, text) is not None
     
     # About agent detection
@@ -1298,13 +1550,13 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
         
         if address_match and is_valid_solana_address(address_match.group(0)):
             wallet_address = address_match.group(0)
-            current_wallet = USER_WALLETS.get(sender)
+            current_wallet = storage.get_user_wallet(sender) # Use storage
             
             if current_wallet and current_wallet != wallet_address:
-                USER_WALLETS[sender] = wallet_address
+                storage.set_user_wallet(sender, wallet_address) # Use storage
                 response = f"I've updated your wallet from {current_wallet[:6]}...{current_wallet[-6:]} to {wallet_address[:6]}...{wallet_address[-6:]}. You can now check your activity without providing the address each time."
             else:
-                USER_WALLETS[sender] = wallet_address
+                storage.set_user_wallet(sender, wallet_address) # Use storage
                 response = f"I've saved {wallet_address[:6]}...{wallet_address[-6:]} as your default wallet. Now you can check your activity without providing the address each time. Try asking 'What's my wallet activity in the last 7 days?'"
         else:
             response = "I couldn't find a valid Solana address in your message. Please try again with a valid address like 'use wallet 78hxw2Hqzns...xZzZMkwtew'"
@@ -1321,8 +1573,8 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 
     # 8. Forget wallet command
     if is_forget_command:
-        if sender in USER_WALLETS:
-            del USER_WALLETS[sender]
+        if storage.get_user_wallet(sender): # Use storage
+            storage.delete_user_wallet(sender) # Use storage
             response = "I've removed your saved wallet address. You'll need to provide your wallet address for future queries or set a new default wallet."
         else:
             response = "You don't have a saved wallet address yet. To save one, try 'use wallet <your-address>'."
@@ -1342,8 +1594,8 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
         activity_type = "nft"
         days = 30
         
-        if sender in USER_WALLETS:
-            wallet_address = USER_WALLETS[sender]
+        wallet_address = storage.get_user_wallet(sender) # Use storage
+        if wallet_address:
             ctx.logger.info(f"Using saved wallet for NFT query: {wallet_address[:8]}...")
         else:
             help_msg = "I'd be happy to show your NFT activity, but I don't have your wallet address saved. Please either include your address in the message or save a default wallet with 'use wallet <your-address>'."
@@ -1359,16 +1611,19 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 
     # 10. General swap query processing
     if is_general_swap_query:
-        if sender in USER_TRANSACTION_HISTORY:
-            user_data = USER_TRANSACTION_HISTORY.get(sender, {})
+        user_data = storage.get_transaction_history(sender) # Use storage
+        if user_data:
             last_txs = user_data.get("transactions", [])
             
+            _, _, platform_filter = parse_query(raw)
             # Find all swaps in stored transactions
             all_swaps = []
             for tx in last_txs:
                 details = tx.get("details", {})
                 if details.get("type") == "defi_swap":
-                    all_swaps.append(tx)
+                    # Only include if no platform filter OR platform matches filter
+                    if not platform_filter or details.get("platform", "").upper() == platform_filter.upper():
+                        all_swaps.append(tx)
             
             if all_swaps:
                 # Format the swap details with nicely grouped information by platform
@@ -1380,7 +1635,10 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                         swaps_by_platform[platform] = []
                     swaps_by_platform[platform].append(swap)
                 
-                swap_info = "Here's a summary of your swaps from the last query:\n\n"
+                if platform_filter:
+                    swap_info = f"Here's a summary of your {platform_filter} swaps:\n\n"
+                else:
+                    swap_info = "Here's a summary of your swaps from the last query:\n\n"
                 
                 # Go through each platform
                 for platform, platform_swaps in swaps_by_platform.items():
@@ -1397,13 +1655,13 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                         
                         from_amount_str = f"{from_amount:.6f}".rstrip('0').rstrip('.') if from_amount != 0 else "?"
                         to_amount_str = f"{to_amount:.6f}".rstrip('0').rstrip('.') if to_amount != 0 else "?"
-                        
+
                         swap_info += f"{i}. {date_str}: {from_amount_str} {from_token} ➝ {to_amount_str} {to_token}\n"
                         swap_info += f"   Transaction: https://solscan.io/tx/{sig}\n"
                     
                     swap_info += "\n"
                 
-                swap_info += "You can ask about specific platforms like 'tell me about my Jupiter swaps' for more details."
+                swap_info += "You can ask about specific platforms like 'tell me about my *Platform* swaps' for more details."
                 
                 await ctx.send(
                     sender,
@@ -1438,8 +1696,8 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             return
 
     # 11. Follow-up questions
-    if is_followup and sender in USER_TRANSACTION_HISTORY:
-        user_data = USER_TRANSACTION_HISTORY.get(sender, {})
+    user_data = storage.get_transaction_history(sender) # Use storage
+    if is_followup and user_data:
         last_wallet = user_data.get("last_wallet")
         last_txs = user_data.get("transactions", [])
 
@@ -1462,7 +1720,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 
     # 12. Using saved wallet or finding wallet in message
     if using_saved_wallet:
-        wallet_address = USER_WALLETS.get(sender)
+        wallet_address = storage.get_user_wallet(sender) # Use storage
         if not wallet_address:
             response = "You don't have a saved wallet address yet. Please provide a wallet address or save one first with 'use wallet <your-address>'."
             await ctx.send(
@@ -1483,16 +1741,18 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             ctx.logger.info(f"Found wallet address in message: {wallet_address[:8]}...")
 
     # 13. Process wallet activity
-    if (is_wallet_query or using_saved_wallet or is_nft_query) and (wallet_address or sender in USER_WALLETS):
-        if not wallet_address and sender in USER_WALLETS:
-            wallet_address = USER_WALLETS[sender]
+    saved_wallet = storage.get_user_wallet(sender) # Use storage
+    if (is_wallet_query or using_saved_wallet or is_nft_query) and (wallet_address or saved_wallet):
+        if not wallet_address and saved_wallet:
+            wallet_address = saved_wallet
             
-        activity_type, days = parse_query(raw)
+        activity_type, days, platform = parse_query(raw)
         
         # Override activity type if it's an explicit NFT query
         if is_nft_query:
             activity_type = "nft"
             days = max(days, 30)  # Use at least 30 days for NFT queries
+            platform = None  # No platform filtering for NFT queries
             
         if days <= 0 or days > 365:
             error_msg = f"The specified time period ({days} days) is invalid. Please use a positive number of days up to 365, e.g., 'last 7 days'."
@@ -1507,7 +1767,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             return
 
         if not wallet_address:
-            if sender in USER_WALLETS:
+            if saved_wallet: # Check again if we fell through without wallet_address but have a saved one
                 use_existing = f"You have a saved wallet, try asking 'What's my wallet activity in the last {days} days?'"
                 await ctx.send(
                     sender,
@@ -1537,20 +1797,26 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                 ctx.logger.info(f"Processing {activity_type.upper()} activity for {wallet_address} over {hours} hours")
             else:
                 ctx.logger.info(f"Processing {activity_type.upper()} activity for {wallet_address} over {days} days")
-
+                
+            time_log = f"{int(days * 24)} hours" if days < 2 else f"{days} days"
+            platform_log = f" on platform {platform}" if platform else ""
+            ctx.logger.info(f"Processing {activity_type.upper()} activity for {wallet_address} over {time_log}{platform_log}")
+            
             txs = await fetch_wallet_activity(wallet_address, days=days, ctx=ctx)
-            summary = await summarize_activity(txs, ctx, activity_type=activity_type, days=days)
+            summary = await summarize_activity(txs, ctx, activity_type=activity_type, days=days, platform=platform)
 
             # Save this query info for transaction history feature
-            USER_TRANSACTION_HISTORY[sender] = {
+            history_data = { # Use storage
                 "last_wallet": wallet_address,
                 "transactions": txs,
                 "last_summary": summary,
-                "timestamp": datetime.now()
+                "timestamp": datetime.now().isoformat() # Use ISO format for JSON compatibility if needed, or keep datetime if pickle handles it
             }
+            storage.set_transaction_history(sender, history_data) # Use storage
 
             # If this was a new wallet and not already saved, suggest saving it
-            if wallet_address not in USER_WALLETS.values() and not using_saved_wallet:
+            current_saved_wallet = storage.get_user_wallet(sender) # Check storage again
+            if wallet_address != current_saved_wallet and not using_saved_wallet:
                 summary += f"\n\nTip: You can save this wallet address for future queries by typing 'use wallet {wallet_address}'"
 
             await ctx.send(
@@ -1597,45 +1863,6 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
 async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     ctx.logger.info(f"Ack from {sender} for msg {msg.acknowledged_msg_id}")
     
-@solana_dialogue.on_initiate_session(StartSessionContent)
-async def on_initiate(ctx: Context, sender: str, msg: StartSessionContent):
-    """First greeting to user when a session starts."""
-    greeting = "👋 Hello! I’m your Solana wallet assistant. How can I help you today?"
-    await ctx.send(
-        sender,
-        ChitChatDialogueMessage(
-            message_id=uuid4(),
-            timestamp=datetime.now(),
-            type="agent_message",
-            agent_message=greeting,
-        ),
-    )
-    
-@solana_dialogue.on_continue_dialogue(ChitChatDialogueMessage)
-async def on_continue(ctx: Context, sender: str, msg: ChitChatDialogueMessage):
-    """Wrap a user’s chit‑chat message into our ChatMessage & reuse handle_message."""
-    user_text = msg.user_message or ""
-    chat_msg = ChatMessage(
-        timestamp=datetime.now(),
-        msg_id=str(uuid4()),
-        content=[TextContent(type="text", text=user_text)],
-    )
-    await handle_message(ctx, sender, chat_msg)
-    
-@solana_dialogue.on_end_session(EndSessionContent)
-async def on_end(ctx: Context, sender: str, msg: EndSessionContent):
-    """Say goodbye when the session ends."""
-    farewell = "👏 Session ended—feel free to ping me any time about your wallet!"
-    await ctx.send(
-        sender,
-        ChitChatDialogueMessage(
-            message_id=uuid4(),
-            timestamp=datetime.now(),
-            type="agent_message",
-            agent_message=farewell,
-        ),
-    )
-
 
 agent.include(chat_proto, publish_manifest=True)
 
