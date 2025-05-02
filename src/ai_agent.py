@@ -478,7 +478,7 @@ def parse_query(text):
         platform = "RAYDIUM"
     elif "orca" in text:
         platform = "ORCA"
-    elif "pump.fun" in text or "pumpfun" in text:
+    elif "pump.fun" in text or "pumpfun" or "PUMP_FUN" in text:
         platform = "PUMP_FUN"
     
     return activity_type, days, platform
@@ -1616,53 +1616,91 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
         if user_data:
             last_txs = user_data.get("transactions", [])
             
-            _, _, platform_filter = parse_query(raw)
+            # Parse query to extract platform and time period
+            _, days_from_query, platform_filter = parse_query(raw)
+            ctx.logger.info(f"Swap query detected with platform: {platform_filter or 'Any'}")
+            
             # Find all swaps in stored transactions
             all_swaps = []
             for tx in last_txs:
                 details = tx.get("details", {})
                 if details.get("type") == "defi_swap":
-                    # Only include if no platform filter OR platform matches filter
-                    if not platform_filter or details.get("platform", "").upper() == platform_filter.upper():
+                    tx_platform = details.get("platform", "").upper()
+                    # Only include if platform matches filter (if specified)
+                    if not platform_filter or platform_filter.upper() == tx_platform:
                         all_swaps.append(tx)
             
             if all_swaps:
                 # Format the swap details with nicely grouped information by platform
                 swaps_by_platform = {}
-                for swap in all_swaps:
-                    details = swap.get("details", {})
-                    platform = details.get("platform", "Unknown Platform").upper()
-                    if platform not in swaps_by_platform:
-                        swaps_by_platform[platform] = []
-                    swaps_by_platform[platform].append(swap)
                 
+                # If platform filter is specified, only show that platform
                 if platform_filter:
-                    swap_info = f"Here's a summary of your {platform_filter} swaps:\n\n"
+                    platform_name = platform_filter.upper()
+                    # Create a section just for the specified platform
+                    platform_swaps = [
+                        tx for tx in all_swaps 
+                        if tx.get("details", {}).get("platform", "").upper() == platform_name
+                    ]
+                    
+                    if platform_swaps:
+                        swaps_by_platform[platform_name] = platform_swaps
+                        swap_info = f"Here's a summary of your {platform_filter} swaps:\n\n"
+                    else:
+                        swap_info = f"No swaps found for platform {platform_filter} in your recent transactions."
+                        await ctx.send(
+                            sender,
+                            ChatMessage(
+                                timestamp=datetime.now(),
+                                msg_id=str(uuid4()),
+                                content=[TextContent(type="text", text=swap_info)]
+                            )
+                        )
+                        return
                 else:
+                    # Otherwise group all swaps by platform
                     swap_info = "Here's a summary of your swaps from the last query:\n\n"
+                    for swap in all_swaps:
+                        details = swap.get("details", {})
+                        platform = details.get("platform", "Unknown Platform").upper()
+                        if platform not in swaps_by_platform:
+                            swaps_by_platform[platform] = []
+                        swaps_by_platform[platform].append(swap)
                 
                 # Go through each platform
                 for platform, platform_swaps in swaps_by_platform.items():
-                    swap_info += f"**{platform} SWAPS ({len(platform_swaps)}):**\n"
-                    for i, swap in enumerate(platform_swaps, 1):
-                        details = swap.get("details", {})
-                        date_str = datetime.fromtimestamp(swap.get("timestamp", 0)).strftime("%b %d %I:%M %p")
-                        sig = swap.get("signature", "unknown")
-                        
-                        from_token = details.get("from_token", "Unknown Token")
-                        to_token = details.get("to_token", "Unknown Token")
+                    swap_info += f"**{platform} SWAPS ({len(platform_swaps)}):**\n\n"
+                    
+                    # Sort by timestamp, newest first
+                    platform_swaps.sort(key=lambda tx: tx.get("timestamp", 0), reverse=True)
+                    
+                    # Format each swap
+                    for tx in platform_swaps:
+                        details = tx.get("details", {})
+                        date_str = datetime.fromtimestamp(tx.get("timestamp", 0)).strftime("%b %d %I:%M %p")
                         from_amount = details.get("from_amount", 0)
+                        from_token = details.get("from_token", "Unknown")
                         to_amount = details.get("to_amount", 0)
+                        to_token = details.get("to_token", "Unknown")
+                        signature = tx.get("signature", "")
                         
-                        from_amount_str = f"{from_amount:.6f}".rstrip('0').rstrip('.') if from_amount != 0 else "?"
-                        to_amount_str = f"{to_amount:.6f}".rstrip('0').rstrip('.') if to_amount != 0 else "?"
-
-                        swap_info += f"{i}. {date_str}: {from_amount_str} {from_token} ➝ {to_amount_str} {to_token}\n"
-                        swap_info += f"   Transaction: https://solscan.io/tx/{sig}\n"
+                        # Format amounts nicely
+                        from_amount_str = f"{from_amount:.6f}".rstrip('0').rstrip('.') if from_amount else "Unknown"
+                        to_amount_str = f"{to_amount:.6f}".rstrip('0').rstrip('.') if to_amount else "Unknown"
+                        
+                        swap_info += f"{date_str}: {from_amount_str} {from_token} ➝ {to_amount_str} {to_token}"
+                        if signature:
+                            swap_info += f" Transaction: https://solscan.io/tx/{signature}\n"
+                        else:
+                            swap_info += "\n"
                     
                     swap_info += "\n"
                 
-                swap_info += "You can ask about specific platforms like 'tell me about my *Platform* swaps' for more details."
+                # Add a closing line with tip
+                if platform_filter:
+                    swap_info += f"You can ask about all swaps with 'Show my swap activity' or about other platforms like 'Show my Raydium swaps'."
+                else:
+                    swap_info += f"You can filter by specific platforms like 'Show my Jupiter swaps' or 'Show my Raydium swaps'."
                 
                 await ctx.send(
                     sender,
@@ -1701,23 +1739,74 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     if is_followup and user_data:
         last_wallet = user_data.get("last_wallet")
         last_txs = user_data.get("transactions", [])
+        last_summary = user_data.get('last_summary', 'No previous summary available')
 
         if last_wallet and last_txs:
-            followup_response = (
-                "I noticed you're asking about the previous transactions. "
-                "Here's a summary of what I showed you earlier:\n\n"
-                f"{user_data.get('last_summary', 'Transaction list unavailable')}\n\n"
-                "For more details on a specific transaction, please ask about it by number or date."
+        # Create context for LLM with previous response and transaction data
+            followup_context = (
+                "You are a Solana blockchain analytics assistant responding to a follow-up question. "
+                "The user previously received information about their wallet transactions, and now has a follow-up question. "
+                "Review the provided previous summary and answer their specific question about the transactions. "
+                "If the question asks about specific transaction details that aren't in the summary, explain that you need more specificity. "
+                "If the question is about a transaction number, refer to that numbered transaction in the previous summary. "
+                "If they ask about overall patterns or specific tokens/platforms in their history, use the summary to inform your answer."
             )
-            await ctx.send(
-                sender,
-                ChatMessage(
-                    timestamp=datetime.now(),
-                    msg_id=str(uuid4()),
-                    content=[TextContent(type="text", text=followup_response)]
+        
+        # Extract specific aspects mentioned in the follow-up
+            specific_tx_match = re.search(r'transaction(?:\s+#?)?\s*(\d+)', text)
+            specific_token_match = re.search(r'(?:about|tell\s+me\s+about)\s+(\w+)\s+(?:token|coin)', text)
+            specific_platform_match = re.search(r'(?:about|on)\s+(jupiter|raydium|orca|pump)', text)
+
+            prompt = (
+                f"The user asked: '{raw}'\n\n"
+                f"Their previous transaction summary was:\n{last_summary}\n\n"
+            )
+            
+            # Add contextual hints based on what they're asking about
+            if specific_tx_match:
+                tx_num = specific_tx_match.group(1)
+                prompt += f"They seem to be asking about transaction #{tx_num}. Find and provide details for this specific transaction.\n"
+            elif specific_token_match:
+                token = specific_token_match.group(1).upper()
+                prompt += f"They seem to be asking about {token} token transactions. Find and summarize these transactions.\n"
+            elif specific_platform_match:
+                platform = specific_platform_match.group(1).upper()
+                prompt += f"They seem to be asking about {platform} platform activity. Provide details focusing on this platform.\n"
+            
+            prompt += "Provide a concise, helpful response addressing their specific follow-up question."
+        
+            try:
+            # Call LLM for intelligent follow-up handling
+                ctx.logger.info(f"Processing follow-up question via LLM: {raw}")
+                response = await get_completion(followup_context, prompt, max_tokens=3000)
+                
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        timestamp=datetime.now(),
+                        msg_id=str(uuid4()),
+                        content=[TextContent(type="text", text=response)]
+                    )
                 )
-            )
-            return
+                return
+            except Exception as e:
+                ctx.logger.error(f"LLM failed for follow-up: {e}")
+                # Fall back to the original approach if LLM fails
+                followup_response = (
+                    "I noticed you're asking about the previous transactions. "
+                    "Here's a summary of what I showed you earlier:\n\n"
+                    f"{last_summary}\n\n"
+                    "For more specific details, you can ask about a particular transaction by number or date."
+                )
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        timestamp=datetime.now(),
+                        msg_id=str(uuid4()),
+                        content=[TextContent(type="text", text=followup_response)]
+                    )
+                )
+                return
 
     # 12. Using saved wallet or finding wallet in message
     if using_saved_wallet:
