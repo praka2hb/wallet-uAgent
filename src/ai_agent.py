@@ -36,7 +36,7 @@ r = redis.Redis(
 agent = Agent(
     name="solana_wallet_agent",
     seed=AGENT_SEED,
-    port=8000,
+    # port=8000,
     mailbox=True,
     publish_agent_details=True,
 )
@@ -472,13 +472,14 @@ def parse_query(text):
     days = min(days, 365)
     
     platform = None
+    text_lower = text.lower()
     if "jupiter" in text:
         platform = "JUPITER"
     elif "raydium" in text:
         platform = "RAYDIUM"
     elif "orca" in text:
         platform = "ORCA"
-    elif "pump.fun" in text or "pumpfun" or "PUMP_FUN" in text:
+    elif any(term in text_lower for term in ["pump.fun", "pumpfun", "pump_fun"]):
         platform = "PUMP_FUN"
     
     return activity_type, days, platform
