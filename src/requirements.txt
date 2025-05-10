@@ -1,0 +1,8 @@
+httpx==0.28.1
+requests==2.32.3
+redis==6.0,0
+python-dotenv==1.0.1
+tenacity==9.0.0
+uagents==0.22.3  # Verify exact version
+gunicorn==21.2.0  # Required for Heroku
+python-json-logger==2.0.7  # For better logging

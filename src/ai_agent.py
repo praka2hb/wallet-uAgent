@@ -24,11 +24,13 @@ ASI_API_KEY = os.getenv("ASI_API_KEY")
 AGENT_SEED = os.getenv("AGENT_SEED")
 ALMANAC_TIMEOUT = 10  # Timeout in seconds for Almanac registration
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = os.getenv("REDIS_PORT")
 
 
 r = redis.Redis(
-  host='evolved-arachnid-10421.upstash.io',
-  port=6379,
+  host=REDIS_HOST,
+  port=REDIS_PORT,
   password= REDIS_PASSWORD,
   ssl=True
 )
@@ -36,7 +38,7 @@ r = redis.Redis(
 agent = Agent(
     name="solana_wallet_agent",
     seed=AGENT_SEED,
-    # port=8000,
+    port=int(os.getenv("PORT", 8000)),  # Use Heroku's PORT
     mailbox=True,
     publish_agent_details=True,
 )
@@ -1436,6 +1438,78 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
     # 3. Initialize response variables
     response = None
     wallet_address = None
+    
+    # Add time-based follow-up detection
+    followup_time_pattern = r'^for\s+(?:the\s+)?(?:last\s+)?(\d+)\s*(day|days|week|weeks|month|months|year|years)$'
+    followup_time_match = re.match(followup_time_pattern, text)
+
+    if followup_time_match:
+        # Get previous context
+        user_data = storage.get_transaction_history(sender)
+        if user_data and user_data.get("last_wallet"):
+            last_wallet = user_data.get("last_wallet")
+            
+            # Extract time period
+            number = int(followup_time_match.group(1))
+            unit = followup_time_match.group(2)
+            
+            # Convert to days
+            if unit in ['week', 'weeks']:
+                days = number * 7
+            elif unit in ['month', 'months']:
+                days = number * 30
+            elif unit in ['year', 'years']:
+                days = number * 365
+            else:
+                days = number
+            
+            # Cap at 365 days
+            days = min(days, 365)
+            
+            # Determine activity type from previous query
+            activity_type = "general"
+            if "DeFi" in user_data.get("last_summary", ""):
+                activity_type = "defi"
+            elif "NFT" in user_data.get("last_summary", ""):
+                activity_type = "nft"
+            
+            # Process the follow-up query
+            try:
+                txs = await fetch_wallet_activity(last_wallet, days=days, ctx=ctx)
+                summary = await summarize_activity(txs, ctx, activity_type=activity_type, days=days)
+                
+                # Update history
+                history_data = {
+                    "last_wallet": last_wallet,
+                    "transactions": txs,
+                    "last_summary": summary,
+                    "timestamp": datetime.now().isoformat()
+                }
+                storage.set_transaction_history(sender, history_data)
+                
+                await ctx.send(
+                    sender,
+                    ChatMessage(
+                        timestamp=datetime.now(),
+                        msg_id=str(uuid4()),
+                        content=[TextContent(type="text", text=summary)]
+                    )
+                )
+                return
+            except Exception as e:
+                ctx.logger.error(f"Error processing time follow-up: {e}", exc_info=True)
+        else:
+            # No previous context
+            response = "I need more context for this query. Please provide a complete request with your wallet address or use a saved wallet."
+            await ctx.send(
+                sender,
+                ChatMessage(
+                    timestamp=datetime.now(),
+                    msg_id=str(uuid4()),
+                    content=[TextContent(type="text", text=response)]
+                )
+            )
+            return
     
     # 4. Enhanced pattern recognition with regex
     # Wallet/Activity related patterns
