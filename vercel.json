@@ -1,0 +1,21 @@
+{
+    "version": 2,
+    "builds": [
+      {
+        "src": "src/ai_agent.py",
+        "use": "@vercel/python",
+        "config": {
+          "maxLambdaSize": "50mb"
+        }
+      }
+    ],
+    "routes": [
+      {
+        "src": "/(.*)",
+        "dest": "src/ai_agent.py"
+      }
+    ],
+    "env": {
+      "PYTHON_VERSION": "3.10"
+    }
+  }
