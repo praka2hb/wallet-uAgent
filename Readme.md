@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/927057e2-6d12-4a7f-9ed2-de2d420b630e
    # Install Dependencies
 
    git clone https://github.com/praka2hb/wallet-uAgent.git
-   cd wallet-Uagent
+   cd wallet-uAgent
 
    pip install -r requirements.txt
 
