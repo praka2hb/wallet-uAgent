@@ -36,20 +36,22 @@ https://github.com/user-attachments/assets/927057e2-6d12-4a7f-9ed2-de2d420b630e
 
 **Deployment Instructions**
 
-1. **Agent Setup**
-2. git clone https://github.com/praka2hb/wallet-uAgent.git
-3. cd wallet-Uagent
+**Agent Setup**
    ```bash
    # Install Dependencies
+
+   git clone https://github.com/praka2hb/wallet-uAgent.git
+   cd wallet-Uagent
+
    pip install -r requirements.txt
 
    #Setup .env
-   - HELIUS_API_KEY: Your Helius API key
-   - ASI_API_KEY: Your ASI API key
-   - AGENT_SEED: Seed for agent generation
-   - REDIS_PASSWORD: Redis password 
-   - REDIS_HOST: Redis Host
-   - REDIS_PORT: Redis Port
+   - HELIUS_API_KEY = Your Helius API key
+   - ASI_API_KEY = Your_ASI_API_key
+   - AGENT_SEED = Seed_for_agent_generation
+   - REDIS_HOST = Redis_Host
+   - REDIS_PASSWORD = Redis_Password 
+   - REDIS_PORT = Redis_Port
 
    #Run The Agent
    python src/ai_agent.py
