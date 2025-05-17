@@ -44,12 +44,12 @@ https://github.com/user-attachments/assets/927057e2-6d12-4a7f-9ed2-de2d420b630e
    pip install -r requirements.txt
 
    #Setup .env
-   - `HELIUS_API_KEY`: Your Helius API key
-   - `ASI_API_KEY`: Your ASI API key
-   - `AGENT_SEED`: Seed for agent generation
-   - `REDIS_PASSWORD`: Redis password (if using custom Redis)
-   - `REDIS_URL`: Heroku Redis URL (automatically set by Heroku Redis addon)
-   - `PORT`: Port number (automatically set by Heroku)
+   - HELIUS_API_KEY: Your Helius API key
+   - ASI_API_KEY: Your ASI API key
+   - AGENT_SEED: Seed for agent generation
+   - REDIS_PASSWORD: Redis password 
+   - REDIS_HOST: Redis Host
+   - REDIS_PORT: Redis Port
 
    #Run The Agent
    python src/ai_agent.py
