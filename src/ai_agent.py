@@ -38,7 +38,6 @@ r = redis.Redis(
 agent = Agent(
     name="solana_wallet_agent",
     seed=AGENT_SEED,
-    port=int(os.getenv("PORT", 8000)),  # Use Heroku's PORT
     mailbox=True,
     publish_agent_details=True,
 )
@@ -1693,13 +1692,17 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
             
             # Parse query to extract platform and time period
             _, days_from_query, platform_filter = parse_query(raw)
-            ctx.logger.info(f"Swap query detected with platform: {platform_filter or 'Any'}")
+            ctx.logger.info(f"Swap query detected with platform: {platform_filter or 'Any'}, period: {days_from_query} days")
+            
+            cutoff_timestamp = int((datetime.now() - timedelta(days=days_from_query)).timestamp())
             
             # Find all swaps in stored transactions
             all_swaps = []
             for tx in last_txs:
                 details = tx.get("details", {})
-                if details.get("type") == "defi_swap":
+                tx_timestamp = tx.get("timestamp", 0)
+                
+                if tx_timestamp >= cutoff_timestamp and details.get("type") == "defi_swap":
                     tx_platform = details.get("platform", "").upper()
                     # Only include if platform matches filter (if specified)
                     if not platform_filter or platform_filter.upper() == tx_platform:
@@ -1720,9 +1723,9 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                     
                     if platform_swaps:
                         swaps_by_platform[platform_name] = platform_swaps
-                        swap_info = f"Here's a summary of your {platform_filter} swaps:\n\n"
+                        swap_info = f"Here's a summary of your {platform_filter} swaps from the last {days_from_query} days:\n\n"
                     else:
-                        swap_info = f"No swaps found for platform {platform_filter} in your recent transactions."
+                        swap_info = f"No swaps found for platform {platform_filter} in the last {days_from_query} days."
                         await ctx.send(
                             sender,
                             ChatMessage(
@@ -1734,7 +1737,7 @@ async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
                         return
                 else:
                     # Otherwise group all swaps by platform
-                    swap_info = "Here's a summary of your swaps from the last query:\n\n"
+                    swap_info = f"Here's a summary of your swaps from the last {days_from_query} days:\n\n"                   
                     for swap in all_swaps:
                         details = swap.get("details", {})
                         platform = details.get("platform", "Unknown Platform").upper()
