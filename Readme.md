@@ -34,26 +34,24 @@ The agent uses Helius API for Solana transaction data and leverages large langua
 
 https://github.com/user-attachments/assets/927057e2-6d12-4a7f-9ed2-de2d420b630e
 
-**Deployment Instructions**
-
 **Agent Setup**
    ```bash
-   # Install Dependencies
-
+   # Clone the Repo
    git clone https://github.com/praka2hb/wallet-uAgent.git
    cd wallet-uAgent
 
+   # Install Dependencies
    pip install -r requirements.txt
 
-   #Setup .env
-   - HELIUS_API_KEY = Your Helius API key
+   # Setup the .env file 
+   - HELIUS_API_KEY = Your_Helius_API key
    - ASI_API_KEY = Your_ASI_API_key
    - AGENT_SEED = Seed_for_agent_generation
    - REDIS_HOST = Redis_Host
    - REDIS_PASSWORD = Redis_Password 
    - REDIS_PORT = Redis_Port
 
-   #Run The Agent
+   # Run The Agent
    python src/ai_agent.py
 
 
